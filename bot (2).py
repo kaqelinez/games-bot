@@ -1,0 +1,1294 @@
+import asyncio
+import html
+import logging
+import os
+import random
+import re
+import socket
+import sqlite3
+import struct
+import time
+from collections import deque
+from datetime import datetime, timedelta, timezone
+
+import aiohttp
+from aiogram import Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, CommandObject
+from aiogram.types import (
+    BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    CallbackQuery,
+    ChatPermissions,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from aiohttp import web
+
+logging.basicConfig(level=logging.INFO)
+
+TOKEN = os.getenv("BOT_TOKEN")
+if not TOKEN:
+    raise SystemExit("Не задана переменная окружения BOT_TOKEN")
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
+START_TIME = time.time()
+
+dp = Dispatcher()
+GROUPS = F.chat.type.in_({"group", "supergroup"})
+
+
+# ---------------------------------------------------------------- КНОПКИ
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text, callback_data=data)
+
+
+def markup(rows) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+HOME = [btn("🏠 Меню", "m:main")]
+
+
+async def safe_edit(cb: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
+    try:
+        await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "not modified" not in str(e):
+            raise
+
+
+def bar(n, total, width: int = 10) -> str:
+    if not total:
+        return "▱" * width
+    filled = max(0, min(width, round(width * n / total)))
+    return "▰" * filled + "▱" * (width - filled)
+
+
+# ---------------------------------------------------------------- БАЗА ДАННЫХ
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.execute(
+    """CREATE TABLE IF NOT EXISTS users(
+        chat_id INTEGER, user_id INTEGER, name TEXT,
+        prefix TEXT DEFAULT '',
+        PRIMARY KEY(chat_id, user_id))"""
+)
+db.execute(
+    """CREATE TABLE IF NOT EXISTS chats(
+        chat_id INTEGER PRIMARY KEY,
+        monitoring INTEGER DEFAULT 1,
+        mimic INTEGER DEFAULT 0)"""
+)
+db.commit()
+
+SETTING_DEFAULTS = {"monitoring": True, "mimic": False}
+
+
+def get_setting(chat_id: int, key: str) -> bool:
+    row = db.execute(
+        f"SELECT {key} FROM chats WHERE chat_id=?", (chat_id,)
+    ).fetchone()
+    if row is None or row[0] is None:
+        return SETTING_DEFAULTS[key]
+    return bool(row[0])
+
+
+def set_setting(chat_id: int, key: str, value: bool):
+    db.execute("INSERT OR IGNORE INTO chats(chat_id) VALUES(?)", (chat_id,))
+    db.execute(f"UPDATE chats SET {key}=? WHERE chat_id=?", (int(value), chat_id))
+    db.commit()
+
+
+def get_prefix(chat_id: int, user_id: int) -> str:
+    row = db.execute(
+        "SELECT prefix FROM users WHERE chat_id=? AND user_id=?",
+        (chat_id, user_id),
+    ).fetchone()
+    return row["prefix"] if row and row["prefix"] else ""
+
+
+def set_prefix(chat_id: int, user, prefix: str):
+    db.execute(
+        "INSERT OR IGNORE INTO users(chat_id, user_id, name) VALUES(?,?,?)",
+        (chat_id, user.id, user.full_name),
+    )
+    db.execute(
+        "UPDATE users SET prefix=?, name=? WHERE chat_id=? AND user_id=?",
+        (prefix, user.full_name, chat_id, user.id),
+    )
+    db.commit()
+
+
+def label(chat_id: int, user) -> str:
+    """Имя игрока с префиксом (обычный текст, без экранирования)."""
+    p = get_prefix(chat_id, user.id)
+    return f"{p} {user.full_name}" if p else user.full_name
+
+
+def fmt_time(sec: int) -> str:
+    m, s = divmod(max(sec, 0), 60)
+    h, m = divmod(m, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} ч")
+    if m:
+        parts.append(f"{m} мин")
+    if not h and not m:
+        parts.append(f"{s} сек")
+    return " ".join(parts)
+
+
+def is_group(message: Message) -> bool:
+    return message.chat.type in ("group", "supergroup")
+
+
+def monitoring_allowed(message: Message) -> bool:
+    if is_group(message):
+        return get_setting(message.chat.id, "monitoring")
+    return True
+
+
+MONITORING_OFF_TEXT = (
+    "🔕 Мониторинг в этом чате выключен. Админ может включить: /monitoringon"
+)
+
+
+# ---------------------------------------------------------------- ВЛАДЕЛЕЦ: ЛОГИ, ПИНГ, МОНИТОРИНГ
+OWNER_IDS = {
+    int(x) for x in os.getenv("OWNER_ID", "").replace(" ", "").split(",") if x.isdigit()
+}
+MON_HOST = os.getenv("MON_HOST", "anmine.ru")
+MON_PORT = int(os.getenv("MON_PORT", "1932") or 1932)  # Bedrock, UDP
+MON_INTERVAL = int(os.getenv("MON_INTERVAL", "120"))
+KEEPALIVE_URL = os.getenv("KEEPALIVE_URL") or os.getenv("RENDER_EXTERNAL_URL")
+
+LOG_BUFFER = deque(maxlen=300)
+
+
+class BufferHandler(logging.Handler):
+    def emit(self, record):
+        LOG_BUFFER.append(self.format(record))
+
+
+_buf = BufferHandler()
+_buf.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+logging.getLogger().addHandler(_buf)
+
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    await message.reply(f"Твой ID: {message.from_user.id}")
+
+
+@dp.message(Command("ping"))
+async def cmd_ping(message: Message):
+    t = time.monotonic()
+    sent = await message.reply("🏓 Проверяю…")
+    ms = int((time.monotonic() - t) * 1000)
+    up = fmt_time(int(time.time() - START_TIME))
+    anti = "включён ✅" if KEEPALIVE_URL else "выключен ❌"
+    await sent.edit_text(
+        "🏓 <b>Понг!</b>\n\n"
+        f"⚡ Ответ за <b>{ms} мс</b>\n"
+        f"⏱ Работаю без перезапуска: <b>{up}</b>\n"
+        f"💤 Анти-сон: <b>{anti}</b>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(F.chat.type == "private", Command("logs"))
+async def cmd_logs(message: Message, command: CommandObject):
+    if message.from_user.id not in OWNER_IDS:
+        await message.answer(
+            "⛔ Только для владельца бота.\n"
+            "Владелец задаётся переменной OWNER_ID на хостинге "
+            "(свой ID можно узнать командой /myid)."
+        )
+        return
+    n = 30
+    if command.args and command.args.strip().isdigit():
+        n = min(max(int(command.args.strip()), 1), 100)
+    lines = list(LOG_BUFFER)[-n:]
+    if not lines:
+        await message.answer("Логи пока пусты.")
+        return
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[-3800:]
+    await message.answer(f"<pre>{html.escape(text)}</pre>", parse_mode="HTML")
+
+
+RAKNET_MAGIC = bytes.fromhex("00ffff00fefefefefdfdfdfd12345678")
+
+
+def _bedrock_ping(host: str, port: int):
+    """Пинг Minecraft Bedrock сервера (RakNet, UDP)."""
+    pkt = (
+        b"\x01"
+        + struct.pack(">q", int(time.time() * 1000))
+        + RAKNET_MAGIC
+        + struct.pack(">q", 2)
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(4)
+    try:
+        t = time.monotonic()
+        sock.sendto(pkt, (host, port))
+        data, _ = sock.recvfrom(4096)
+        ms = int((time.monotonic() - t) * 1000)
+    except Exception:
+        return None
+    finally:
+        sock.close()
+    if len(data) < 35 or data[0] != 0x1C:
+        return None
+    n = struct.unpack(">H", data[33:35])[0]
+    parts = data[35:35 + n].decode("utf-8", "ignore").split(";")
+    info = {"ms": ms, "motd": parts[1] if len(parts) > 1 else "",
+            "online": None, "max": None}
+    try:
+        info["online"] = int(parts[4])
+        info["max"] = int(parts[5])
+    except (IndexError, ValueError):
+        pass
+    return info
+
+
+async def check_host() -> dict:
+    info = await asyncio.to_thread(_bedrock_ping, MON_HOST, MON_PORT)
+    return {"up": info is not None, "info": info}
+
+
+def fmt_check(res: dict) -> str:
+    """Короткий текст для уведомлений владельцу."""
+    if not res["up"]:
+        return f"🖥 {MON_HOST}:{MON_PORT}: 🔴 Недоступен (нет ответа)"
+    i = res["info"]
+    line = f"🖥 {MON_HOST}:{MON_PORT}: 🟢 Онлайн, {i['ms']} мс"
+    if i["online"] is not None:
+        line += f"\n👥 Игроков: {i['online']}/{i['max']}"
+    return line
+
+
+async def view_status():
+    res = await check_host()
+    if res["up"]:
+        i = res["info"]
+        text = f"🖥 <b>{html.escape(MON_HOST)}</b>\n\n🟢 <b>Онлайн</b> · {i['ms']} мс"
+        if i["online"] is not None:
+            text += f"\n👥 {bar(i['online'], i['max'])} {i['online']}/{i['max']}"
+        if i["motd"]:
+            text += f"\n📝 {html.escape(i['motd'])}"
+    else:
+        text = (
+            f"🖥 <b>{html.escape(MON_HOST)}</b>\n\n🔴 <b>Недоступен</b>\n"
+            "Сервер не ответил на пинг."
+        )
+    kb = markup([[btn("🔄 Обновить", "m:status")] + HOME])
+    return text, kb
+
+
+# ---- онлайн по серверам (данные берём с сайта anclan.ru)
+ONLINE_URL = os.getenv("ONLINE_URL", "https://anclan.ru")
+SKIP_LINES = {"В избранное", "Уведомлять о входе", "Скопировать ник"}
+
+
+def parse_online(page: str):
+    page = re.sub(r"(?is)<(script|style).*?</\1>", " ", page)
+    page = re.sub(r"<[^>]+>", "\n", page)
+    page = html.unescape(page)
+    page = re.sub(r"(\d+)\s*\n\s*/\s*\n\s*(\d+)", r"\1/\2", page)
+    page = re.sub(r"AnMine\s*#\s*(\d+)", r"AnMine #\1", page)
+    lines = [ln.strip() for ln in page.splitlines() if ln.strip()]
+    servers, cur = [], None
+    for i, ln in enumerate(lines):
+        if re.fullmatch(r"AnMine #\d+", ln):
+            cur = {"name": ln, "online": None, "max": None, "players": []}
+            servers.append(cur)
+            continue
+        if cur is None:
+            continue
+        c = re.fullmatch(r"(\d+)\s*/\s*(\d+)", ln)
+        if c and cur["online"] is None:
+            cur["online"], cur["max"] = int(c.group(1)), int(c.group(2))
+            continue
+        if ln == "В избранное" and cur["online"] is not None and i > 0:
+            nick = lines[i - 1]
+            if nick not in SKIP_LINES and not re.fullmatch(r"\d\d:\d\d:\d\d", nick):
+                cur["players"].append(nick)
+    return servers
+
+
+async def fetch_online():
+    timeout = aiohttp.ClientTimeout(total=15)
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as sess:
+        async with sess.get(ONLINE_URL) as r:
+            page = await r.text()
+    return parse_online(page)
+
+
+def server_num(name: str) -> str:
+    m = re.search(r"#(\d+)", name)
+    return m.group(1) if m else name
+
+
+async def view_online(n=None):
+    try:
+        servers = await fetch_online()
+    except Exception:
+        logging.exception("online fetch failed")
+        servers = None
+
+    if not servers:
+        text = "❌ <b>Не удалось получить онлайн</b>\nanclan.ru не ответил или сайт изменился."
+        return text, markup([[btn("🔄 Повторить", "o:all")] + HOME])
+
+    if n is not None:
+        srv = next((x for x in servers if server_num(x["name"]) == str(n)), None)
+        if not srv:
+            return (
+                f"Сервера #{n} нет на сайте.",
+                markup([[btn("◀️ К серверам", "o:all")] + HOME]),
+            )
+        head = (
+            f"🎮 <b>{html.escape(srv['name'])}</b>\n"
+            f"{bar(srv['online'], srv['max'])} {srv['online']}/{srv['max']}\n\n"
+        )
+        body = ", ".join(html.escape(x) for x in srv["players"]) or "Никого нет"
+        if len(body) > 3400:
+            body = body[:3400].rsplit(", ", 1)[0] + "\n… список обрезан"
+        kb = markup([
+            [btn("◀️ К серверам", "o:all"), btn("🔄 Обновить", f"o:{n}")],
+            HOME,
+        ])
+        return head + body, kb
+
+    total = sum(x["online"] or 0 for x in servers)
+    blocks = [
+        f"🎮 <b>{html.escape(x['name'])}</b>\n{bar(x['online'], x['max'])} {x['online']}/{x['max']}"
+        for x in servers
+    ]
+    text = (
+        "🌐 <b>Онлайн AnMine</b>\n\n" + "\n\n".join(blocks)
+        + f"\n\n👥 Всего: <b>{total}</b>\nНажми на сервер, чтобы увидеть ники 👇"
+    )
+    buttons = [btn(f"👥 #{server_num(x['name'])}", f"o:{server_num(x['name'])}") for x in servers]
+    rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+    rows.append([btn("🔄 Обновить", "o:all")] + HOME)
+    return text, markup(rows)
+
+
+@dp.message(Command("server"))
+async def cmd_server(message: Message):
+    if not monitoring_allowed(message):
+        await message.reply(MONITORING_OFF_TEXT)
+        return
+    text, kb = await view_status()
+    await message.reply(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.message(Command("online"))
+async def cmd_online(message: Message, command: CommandObject):
+    if not monitoring_allowed(message):
+        await message.reply(MONITORING_OFF_TEXT)
+        return
+    arg = (command.args or "").strip()
+    text, kb = await view_online(int(arg) if arg.isdigit() else None)
+    await message.reply(text, parse_mode="HTML", reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("o:"))
+async def cb_online(cb: CallbackQuery):
+    if cb.message.chat.type in ("group", "supergroup") and not get_setting(
+        cb.message.chat.id, "monitoring"
+    ):
+        await cb.answer("🔕 Мониторинг в этом чате выключен", show_alert=True)
+        return
+    arg = cb.data[2:]
+    text, kb = await view_online(int(arg) if arg.isdigit() else None)
+    await safe_edit(cb, text, kb)
+    await cb.answer()
+
+
+monitor_state = {"up": None}
+
+
+async def monitor_loop(bot: Bot):
+    while True:
+        try:
+            res = await check_host()
+            if (
+                monitor_state["up"] is not None
+                and res["up"] != monitor_state["up"]
+            ):
+                for oid in OWNER_IDS:
+                    try:
+                        await bot.send_message(oid, "⚠️ Статус изменился\n" + fmt_check(res))
+                    except Exception:
+                        pass
+            monitor_state["up"] = res["up"]
+        except Exception:
+            logging.exception("monitor error")
+        await asyncio.sleep(MON_INTERVAL)
+
+
+async def keepalive_loop():
+    """Раз в 10 минут обращается к собственному адресу, чтобы хостинг не усыплял бота."""
+    if not KEEPALIVE_URL:
+        logging.info("keepalive выключен (нет RENDER_EXTERNAL_URL / KEEPALIVE_URL)")
+        return
+    timeout = aiohttp.ClientTimeout(total=15)
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as sess:
+                async with sess.get(KEEPALIVE_URL) as r:
+                    logging.info("keepalive: %s", r.status)
+        except Exception:
+            logging.warning("keepalive не удался")
+
+
+# ---------------------------------------------------------------- ЛИЧКА
+@dp.message(F.chat.type == "private")
+async def private_any(message: Message):
+    me = await message.bot.me()
+    kb = markup([[InlineKeyboardButton(
+        text="➕ Добавить в группу",
+        url=f"https://t.me/{me.username}?startgroup=true",
+    )]])
+    await message.answer(
+        "👋 <b>Привет!</b>\n\n"
+        "Я работаю только в группах: крестики-нолики, крокодил, "
+        "статус сервера и многое другое.\n\n"
+        "Добавь меня в чат и напиши /start 🎮",
+        parse_mode="HTML",
+        reply_markup=kb,
+    )
+
+
+# ---------------------------------------------------------------- ГЛАВНОЕ МЕНЮ
+HELP_TEXT = (
+    "❓ <b>Все команды</b>\n\n"
+    "🎮 <b>Игры</b>\n"
+    "/xo — крестики-нолики\n"
+    "/croc — крокодил, /top — счёт\n\n"
+    "🖥 <b>Сервер</b>\n"
+    "/server — статус anmine.ru\n"
+    "/online — онлайн, /online 1 — ники\n\n"
+    "👤 /profile — профиль и префикс\n"
+    "🏓 /ping — скорость ответа бота\n\n"
+    "🛡 <b>Для админов</b>\n"
+    "/mute [30m|2h|1d], /unmute, /ban, /unban, /kick — ответом на сообщение\n"
+    "/giveprefix текст, /removeprefix — префиксы (ответом)\n"
+    "/monitoringon, /monitoringoff — вкл/выкл /server и /online\n"
+    "/mimicon, /mimicoff — режим кривляния\n\n"
+    "Для крокодила и кривляния отключи Privacy Mode у бота "
+    "(@BotFather → /setprivacy → Disable). Для мута и бана бот должен быть "
+    "админом группы."
+)
+
+MAIN_ROWS = [
+    [btn("🎮 Игры", "m:games"), btn("🖥 Сервер", "m:server")],
+    [btn("👤 Профиль", "m:profile"), btn("⚙️ Настройки", "m:settings")],
+    [btn("❓ Команды", "m:help")],
+]
+
+
+def main_text(user) -> str:
+    return (
+        f"👋 <b>Привет, {html.escape(user.first_name or 'друг')}!</b>\n\n"
+        "Я — игровой бот этого чата.\n"
+        "Выбери раздел 👇"
+    )
+
+
+def profile_text(chat_id: int, user) -> str:
+    p = get_prefix(chat_id, user.id)
+    return (
+        f"👤 <b>{html.escape(label(chat_id, user))}</b>\n\n"
+        f"🏷 Префикс: <b>{html.escape(p) if p else 'нет'}</b>\n\n"
+        "<i>Префикс выдают админы чата.</i>"
+    )
+
+
+def settings_view(chat_id: int):
+    mon = get_setting(chat_id, "monitoring")
+    mim = get_setting(chat_id, "mimic")
+    text = (
+        "⚙️ <b>Настройки чата</b>\n\n"
+        f"🖥 Мониторинг сервера: <b>{'включён' if mon else 'выключен'}</b>\n"
+        f"🤪 Режим кривляния: <b>{'включён' if mim else 'выключен'}</b>\n\n"
+        "<i>Менять могут только админы чата.</i>"
+    )
+    kb = markup([
+        [btn(f"{'✅' if mon else '❌'} Мониторинг", "s:monitoring")],
+        [btn(f"{'✅' if mim else '❌'} Кривляние", "s:mimic")],
+        HOME,
+    ])
+    return text, kb
+
+
+@dp.message(GROUPS, Command("start", "menu", "games", "help"))
+async def cmd_menu(message: Message):
+    await message.answer(
+        main_text(message.from_user),
+        parse_mode="HTML",
+        reply_markup=markup(MAIN_ROWS),
+    )
+
+
+@dp.callback_query(F.data.startswith("m:"))
+async def cb_menu(cb: CallbackQuery):
+    action = cb.data[2:]
+    chat_id = cb.message.chat.id
+    u = cb.from_user
+
+    if action == "main":
+        await safe_edit(cb, main_text(u), markup(MAIN_ROWS))
+
+    elif action == "games":
+        await safe_edit(
+            cb,
+            "🎮 <b>Игры</b>\n\nВо что сыграем?",
+            markup([
+                [btn("❌⭕ Крестики-нолики", "m:xo"), btn("🐊 Крокодил", "m:croc")],
+                [btn("🏆 Топ крокодила", "m:top")],
+                HOME,
+            ]),
+        )
+
+    elif action == "xo":
+        await start_xo(cb.message, u)
+
+    elif action == "croc":
+        started = await start_croc(cb.message)
+        if not started:
+            await cb.answer("Игра уже идёт 🐊", show_alert=True)
+            return
+
+    elif action == "top":
+        await send_top(cb.message)
+
+    elif action == "server":
+        await safe_edit(
+            cb,
+            "🖥 <b>Сервер</b>\n\nСтатус и онлайн AnMine:",
+            markup([
+                [btn("📡 Статус", "m:status"), btn("👥 Онлайн", "o:all")],
+                HOME,
+            ]),
+        )
+
+    elif action == "status":
+        if cb.message.chat.type in ("group", "supergroup") and not get_setting(
+            chat_id, "monitoring"
+        ):
+            await cb.answer("🔕 Мониторинг в этом чате выключен", show_alert=True)
+            return
+        text, kb = await view_status()
+        await safe_edit(cb, text, kb)
+
+    elif action == "profile":
+        await safe_edit(cb, profile_text(chat_id, u), markup([HOME]))
+
+    elif action == "settings":
+        text, kb = settings_view(chat_id)
+        await safe_edit(cb, text, kb)
+
+    elif action == "help":
+        await safe_edit(cb, HELP_TEXT, markup([HOME]))
+
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("s:"))
+async def cb_settings(cb: CallbackQuery):
+    key = cb.data[2:]
+    if key not in SETTING_DEFAULTS:
+        await cb.answer()
+        return
+    chat_id = cb.message.chat.id
+    m = await cb.bot.get_chat_member(chat_id, cb.from_user.id)
+    if m.status not in ("creator", "administrator"):
+        await cb.answer("⛔ Только для админов чата", show_alert=True)
+        return
+    set_setting(chat_id, key, not get_setting(chat_id, key))
+    text, kb = settings_view(chat_id)
+    await safe_edit(cb, text, kb)
+    await cb.answer("Готово ✅")
+
+
+# ---------------------------------------------------------------- АДМИН-ПРОВЕРКИ
+async def require_admin(message: Message) -> bool:
+    m = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+    if m.status not in ("creator", "administrator"):
+        await message.reply("⛔ Эта команда только для админов чата.")
+        return False
+    return True
+
+
+def reply_target(message: Message):
+    rep = message.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot:
+        return rep.from_user
+    return None
+
+
+# ---------------------------------------------------------------- ПЕРЕКЛЮЧАТЕЛИ КОМАНДАМИ
+async def toggle(message: Message, key: str, value: bool, on_text: str, off_text: str):
+    if not await require_admin(message):
+        return
+    set_setting(message.chat.id, key, value)
+    await message.reply(on_text if value else off_text)
+
+
+@dp.message(GROUPS, Command("monitoringon"))
+async def cmd_monitoring_on(message: Message):
+    await toggle(
+        message, "monitoring", True,
+        "🟢 Мониторинг включён: /server и /online снова работают в этом чате.",
+        "",
+    )
+
+
+@dp.message(GROUPS, Command("monitoringoff", "monitoringonoff"))
+async def cmd_monitoring_off(message: Message):
+    await toggle(
+        message, "monitoring", False,
+        "",
+        "🔕 Мониторинг выключен: /server и /online в этом чате не работают.",
+    )
+
+
+@dp.message(GROUPS, Command("mimicon"))
+async def cmd_mimic_on(message: Message):
+    await toggle(
+        message, "mimic", True,
+        "🤪 Режим кривляния включён! Теперь могу передразнивать и отвечать.",
+        "",
+    )
+
+
+@dp.message(GROUPS, Command("mimicoff"))
+async def cmd_mimic_off(message: Message):
+    await toggle(
+        message, "mimic", False,
+        "",
+        "😐 Режим кривляния выключен.",
+    )
+
+
+# ---------------------------------------------------------------- ПРЕФИКСЫ (только админы)
+@dp.message(GROUPS, Command("giveprefix"))
+async def cmd_giveprefix(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    text = (command.args or "").strip()
+    if not t or not text:
+        await message.reply("Ответь на сообщение участника: /giveprefix 🔥 Легенда")
+        return
+    if len(text) > 20:
+        await message.reply("Префикс слишком длинный (максимум 20 символов).")
+        return
+    set_prefix(message.chat.id, t, text)
+    await message.reply(f"🏷 {t.full_name} получил префикс «{text}».")
+
+
+@dp.message(GROUPS, Command("removeprefix"))
+async def cmd_removeprefix(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /removeprefix")
+        return
+    set_prefix(message.chat.id, t, "")
+    await message.reply(f"🏷 Префикс у {t.full_name} снят.")
+
+
+@dp.message(GROUPS, Command("profile", "prefix"))
+async def cmd_profile(message: Message):
+    t = reply_target(message) or message.from_user
+    await message.reply(
+        profile_text(message.chat.id, t),
+        parse_mode="HTML",
+        reply_markup=markup([HOME]),
+    )
+
+
+# ---------------------------------------------------------------- МОДЕРАЦИЯ
+def parse_duration(args):
+    if not args:
+        return timedelta(minutes=10)
+    m = re.fullmatch(r"(\d+)\s*([mhdмчд]?)", args.strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2) or "m"
+    if n <= 0:
+        return None
+    if unit in ("h", "ч"):
+        d = timedelta(hours=n)
+    elif unit in ("d", "д"):
+        d = timedelta(days=n)
+    else:
+        d = timedelta(minutes=n)
+    return min(d, timedelta(days=365))
+
+
+async def mod_error(message: Message, e: Exception):
+    text = getattr(e, "message", str(e))
+    await message.reply(
+        f"❌ Не получилось: {text}\n"
+        "Проверь, что бот — админ группы с правом ограничивать/банить участников, "
+        "и что цель — не админ."
+    )
+
+
+@dp.message(GROUPS, Command("mute"))
+async def cmd_mute(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /mute 30m")
+        return
+    delta = parse_duration(command.args)
+    if delta is None:
+        await message.reply("Формат: /mute 30m, /mute 2h, /mute 1d (по умолчанию 10 минут)")
+        return
+    until = datetime.now(timezone.utc) + delta
+    try:
+        await message.bot.restrict_chat_member(
+            message.chat.id,
+            t.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    mins = int(delta.total_seconds() // 60)
+    await message.reply(f"🔇 {t.full_name} в муте на {fmt_time(mins * 60)}.")
+
+
+@dp.message(GROUPS, Command("unmute"))
+async def cmd_unmute(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /unmute")
+        return
+    try:
+        await message.bot.restrict_chat_member(
+            message.chat.id,
+            t.id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_invite_users=True,
+            ),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply(f"🔊 {t.full_name} размучен.")
+
+
+@dp.message(GROUPS, Command("ban"))
+async def cmd_ban(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /ban")
+        return
+    try:
+        await message.bot.ban_chat_member(message.chat.id, t.id)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply(f"🔨 {t.full_name} забанен.")
+
+
+@dp.message(GROUPS, Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    uid = t.id if t else None
+    if uid is None and command.args and command.args.strip().isdigit():
+        uid = int(command.args.strip())
+    if uid is None:
+        await message.reply("Ответь командой на сообщение или укажи ID: /unban 123456")
+        return
+    try:
+        await message.bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply("✅ Пользователь разбанен, может вернуться по ссылке.")
+
+
+@dp.message(GROUPS, Command("kick"))
+async def cmd_kick(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /kick")
+        return
+    try:
+        await message.bot.ban_chat_member(message.chat.id, t.id)
+        await message.bot.unban_chat_member(message.chat.id, t.id, only_if_banned=True)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply(f"👢 {t.full_name} исключён.")
+
+
+# ---------------------------------------------------------------- КРЕСТИКИ-НОЛИКИ
+xo_games: dict[str, dict] = {}
+LINES = [
+    (0, 1, 2), (3, 4, 5), (6, 7, 8),
+    (0, 3, 6), (1, 4, 7), (2, 5, 8),
+    (0, 4, 8), (2, 4, 6),
+]
+SYM = {"X": "❌", "O": "⭕", " ": "⬜"}
+
+
+def xo_winner(board):
+    for a, b, c in LINES:
+        if board[a] != " " and board[a] == board[b] == board[c]:
+            return board[a]
+    return None
+
+
+def xo_keyboard(g):
+    if g["o"] is None:
+        return markup([[btn("⭕ Присоединиться", "xo:join")]])
+    rows = []
+    for r in range(3):
+        rows.append([btn(SYM[g["board"][r * 3 + c]], f"xo:{r * 3 + c}") for c in range(3)])
+    if g["over"]:
+        rows.append([btn("🔄 Новая игра", "xo:new")])
+    return markup(rows)
+
+
+def xo_text(g, result=None):
+    o_name = g["o"][1] if g["o"] else "???"
+    head = f"❌ {g['x'][1]}  ⚔️  ⭕ {o_name}"
+    if g["o"] is None:
+        return f"{head}\n\n⏳ Ждём второго игрока…"
+    if result == "draw":
+        return f"{head}\n\n🤝 Ничья!"
+    if result in ("X", "O"):
+        name = g["x"][1] if result == "X" else g["o"][1]
+        return f"{head}\n\n🏆 Победил(а) {name} {SYM[result]}"
+    turn_name = g["x"][1] if g["turn"] == "X" else g["o"][1]
+    return f"{head}\n\n👉 Ходит: {turn_name} {SYM[g['turn']]}"
+
+
+async def start_xo(target: Message, u):
+    g = {
+        "board": [" "] * 9,
+        "x": (u.id, label(target.chat.id, u)),
+        "o": None,
+        "turn": "X",
+        "over": False,
+    }
+    msg = await target.answer(xo_text(g), reply_markup=xo_keyboard(g))
+    xo_games[f"{msg.chat.id}:{msg.message_id}"] = g
+
+
+@dp.message(GROUPS, Command("xo"))
+async def cmd_xo(message: Message):
+    await start_xo(message, message.from_user)
+
+
+@dp.callback_query(F.data.startswith("xo:"))
+async def xo_click(cb: CallbackQuery):
+    action = cb.data.split(":")[1]
+    u = cb.from_user
+
+    if action == "new":
+        await start_xo(cb.message, u)
+        await cb.answer()
+        return
+
+    key = f"{cb.message.chat.id}:{cb.message.message_id}"
+    g = xo_games.get(key)
+    if not g:
+        await cb.answer("Эта игра уже не активна. Начни новую: /xo", show_alert=True)
+        return
+
+    if action == "join":
+        if g["o"] is not None:
+            await cb.answer("Уже есть второй игрок")
+            return
+        if u.id == g["x"][0]:
+            await cb.answer("Нужен другой игрок 🙂", show_alert=True)
+            return
+        g["o"] = (u.id, label(cb.message.chat.id, u))
+        await cb.message.edit_text(xo_text(g), reply_markup=xo_keyboard(g))
+        await cb.answer()
+        return
+
+    if g["over"] or g["o"] is None:
+        await cb.answer()
+        return
+
+    cur = g["x"] if g["turn"] == "X" else g["o"]
+    if u.id != cur[0]:
+        if u.id in (g["x"][0], g["o"][0]):
+            await cb.answer("Сейчас не твой ход")
+        else:
+            await cb.answer("Ты не участвуешь в этой игре", show_alert=True)
+        return
+
+    i = int(action)
+    if g["board"][i] != " ":
+        await cb.answer("Клетка занята")
+        return
+
+    g["board"][i] = g["turn"]
+    win = xo_winner(g["board"])
+    if win:
+        g["over"] = True
+        await cb.message.edit_text(xo_text(g, win), reply_markup=xo_keyboard(g))
+    elif " " not in g["board"]:
+        g["over"] = True
+        await cb.message.edit_text(xo_text(g, "draw"), reply_markup=xo_keyboard(g))
+    else:
+        g["turn"] = "O" if g["turn"] == "X" else "X"
+        await cb.message.edit_text(xo_text(g), reply_markup=xo_keyboard(g))
+    await cb.answer()
+
+
+# ---------------------------------------------------------------- КРОКОДИЛ
+WORDS = [
+    "слон", "самолёт", "гитара", "компьютер", "бабочка", "холодильник",
+    "велосипед", "динозавр", "пингвин", "вулкан", "зонтик", "робот",
+    "футбол", "космонавт", "арбуз", "телефон", "паук", "корабль",
+    "дракон", "кактус", "шоколад", "радуга", "пират", "снеговик",
+    "фокусник", "жираф", "микроволновка", "маяк", "ниндзя", "верблюд",
+    "парашют", "водопад", "утюг", "обезьяна", "мороженое", "лифт",
+    "будильник", "крокодил", "пылесос", "рыцарь", "акула", "очки",
+    "батут", "попугай", "танк", "ёлка", "пицца", "сантехник",
+    "зомби", "бумеранг", "кенгуру", "лыжи", "скейтборд", "привидение",
+]
+
+croc: dict[int, dict] = {}         # chat_id -> состояние игры
+croc_scores: dict[int, dict] = {}  # chat_id -> {user_id: (name, очки)}
+
+
+def norm(s: str) -> str:
+    return s.strip().lower().replace("ё", "е")
+
+
+def lead_kb():
+    return markup([[btn("🎤 Хочу быть ведущим", "cr:lead")]])
+
+
+def game_kb():
+    return markup([
+        [btn("👀 Посмотреть слово", "cr:see")],
+        [btn("🔄 Другое слово", "cr:new"), btn("🏳️ Сдаться", "cr:giveup")],
+    ])
+
+
+async def start_croc(target: Message) -> bool:
+    g = croc.get(target.chat.id)
+    if g and g["active"]:
+        return False
+    await target.answer(
+        "🐊 <b>Крокодил</b>\n\nКто объясняет слово?",
+        parse_mode="HTML",
+        reply_markup=lead_kb(),
+    )
+    return True
+
+
+async def send_top(target: Message):
+    scores = croc_scores.get(target.chat.id)
+    if not scores:
+        await target.answer("Пока нет очков. Сыграйте в /croc 🐊")
+        return
+    medals = ["🥇", "🥈", "🥉"]
+    top = sorted(scores.values(), key=lambda x: x[1], reverse=True)[:10]
+    lines = [
+        f"{medals[i] if i < 3 else f'{i + 1}.'} {html.escape(n)} — <b>{s}</b>"
+        for i, (n, s) in enumerate(top)
+    ]
+    await target.answer(
+        "🏆 <b>Топ крокодила</b>\n\n" + "\n".join(lines), parse_mode="HTML"
+    )
+
+
+@dp.message(GROUPS, Command("croc"))
+async def cmd_croc(message: Message):
+    g = croc.get(message.chat.id)
+    if g and g["active"]:
+        await message.answer(
+            f"Игра уже идёт, ведущий — {html.escape(g['leader'][1])} 🐊",
+            parse_mode="HTML",
+        )
+        return
+    await start_croc(message)
+
+
+@dp.message(GROUPS, Command("top"))
+async def cmd_top(message: Message):
+    await send_top(message)
+
+
+@dp.callback_query(F.data == "cr:lead")
+async def croc_lead(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    g = croc.get(chat_id)
+    if g and g["active"]:
+        await cb.answer("Ведущий уже выбран", show_alert=True)
+        return
+    u = cb.from_user
+    name = label(chat_id, u)
+    croc[chat_id] = {
+        "active": True,
+        "leader": (u.id, name),
+        "word": random.choice(WORDS),
+    }
+    await cb.message.edit_text(
+        f"🐊 Ведущий: <b>{html.escape(name)}</b>\n\n"
+        "Нажми «Посмотреть слово» и объясняй его без однокоренных слов.\n"
+        "Остальные — пишите ответы прямо в чат! 💬",
+        parse_mode="HTML",
+        reply_markup=game_kb(),
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.in_({"cr:see", "cr:new", "cr:giveup"}))
+async def croc_leader_actions(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    g = croc.get(chat_id)
+    if not g or not g["active"]:
+        await cb.answer("Игра не активна. Начни: /croc", show_alert=True)
+        return
+    if cb.from_user.id != g["leader"][0]:
+        await cb.answer("Это кнопки только для ведущего 🙂", show_alert=True)
+        return
+
+    if cb.data == "cr:see":
+        await cb.answer(f"Твоё слово: {g['word']}", show_alert=True)
+    elif cb.data == "cr:new":
+        old = g["word"]
+        while g["word"] == old:
+            g["word"] = random.choice(WORDS)
+        await cb.answer(f"Новое слово: {g['word']}", show_alert=True)
+    else:
+        word = g["word"]
+        g["active"] = False
+        await cb.message.edit_text(
+            f"🏳️ Ведущий сдался. Слово было: <b>{word}</b>",
+            parse_mode="HTML",
+        )
+        await cb.message.answer("Играем ещё?", reply_markup=lead_kb())
+        await cb.answer()
+
+
+# ---------------------------------------------------------------- РЕЖИМ КРИВЛЯНИЯ
+MIMIC_CHANCE = float(os.getenv("MIMIC_CHANCE", "0.3"))  # шанс ответить на сообщение
+MIMIC_COOLDOWN = 4  # секунд между случайными ответами в одном чате
+mimic_last: dict[int, float] = {}
+
+VOWELS = "аеёиоуыэюяaeiou"
+GREET = ["Привет!", "Здарова 👋", "Ну привет)", "О, кто пришёл!"]
+HOWARE = ["Нормально, а у тебя?", "Живу, не жалуюсь", "Лучше всех!", "Бывало и лучше 😅"]
+YESNO = [
+    "Да", "Нет", "Наверное", "Конечно!", "Даже не думай",
+    "Хм... 50 на 50", "Однозначно нет", "Скорее да, чем нет",
+]
+THANKS = ["Обращайся!", "Пожалуйста 😌"]
+
+
+def kover(text: str) -> str:
+    """Коверкает чужой текст случайным способом."""
+    text = text.strip()
+    words = text.split()
+    if not words:
+        return text
+    mode = random.choice(["spongebob", "baby", "stretch", "echo", "shout", "reverse"])
+    if mode == "spongebob":
+        out, up = [], False
+        for ch in text:
+            if ch.isalpha():
+                out.append(ch.upper() if up else ch.lower())
+                up = not up
+            else:
+                out.append(ch)
+        return "".join(out)
+    if mode == "baby":
+        table = str.maketrans("рРшШжЖлЛ", "лЛсСзЗвВ")
+        return text.translate(table) + " 🥺"
+    if mode == "stretch":
+        w = words[-1]
+        words[-1] = "".join(
+            ch * random.randint(2, 4) if ch.lower() in VOWELS else ch for ch in w
+        )
+        return " ".join(words) + "~"
+    if mode == "echo":
+        last = words[-1]
+        return f"{last}... {last}... {last}..."
+    if mode == "shout":
+        return text.upper() + "!!!"
+    return " ".join(reversed(words))
+
+
+def try_answer(text: str):
+    """Простые ответы по правилам. Если не подошло — None."""
+    t = text.lower().strip()
+    if re.search(r"\b(привет|здаров|здравствуй|хай)\b", t):
+        return random.choice(GREET)
+    if "как дела" in t or "как ты" in t:
+        return random.choice(HOWARE)
+    if re.search(r"\b(спасибо|спс|благодарю)\b", t):
+        return random.choice(THANKS)
+    if t.endswith("?"):
+        return random.choice(YESNO)
+    return None
+
+
+async def maybe_mimic(message: Message):
+    chat_id = message.chat.id
+    if not get_setting(chat_id, "mimic"):
+        return
+    text = (message.text or "").strip()
+    if not text or len(text) > 200 or re.fullmatch(r"https?://\S+", text):
+        return
+
+    me = await message.bot.me()
+    mention = f"@{me.username}".lower() if me.username else None
+    replied_to_bot = bool(
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == me.id
+    )
+    direct = replied_to_bot or bool(mention and mention in text.lower())
+
+    now = time.time()
+    if not direct:
+        if random.random() > MIMIC_CHANCE:
+            return
+        if now - mimic_last.get(chat_id, 0) < MIMIC_COOLDOWN:
+            return
+    mimic_last[chat_id] = now
+
+    if mention:
+        text = re.sub(re.escape(mention), "", text, flags=re.I).strip()
+    if not text:
+        await message.reply("Чего?")
+        return
+
+    reply = try_answer(text) or kover(text)
+    await message.reply(reply[:300])
+
+
+# ---------------------------------------------------------------- ТЕКСТ В ГРУППЕ
+# Ловит обычные сообщения (не команды): ответы в крокодиле и кривляние
+@dp.message(GROUPS, F.text, ~F.text.startswith("/"))
+async def group_text(message: Message):
+    chat_id = message.chat.id
+    u = message.from_user
+    if u is None or u.is_bot:
+        return
+
+    g = croc.get(chat_id)
+    if g and g["active"]:
+        # пока идёт крокодил — только проверяем ответы
+        if u.id != g["leader"][0] and norm(message.text) == norm(g["word"]):
+            g["active"] = False
+            name = label(chat_id, u)
+            chat_scores = croc_scores.setdefault(chat_id, {})
+            _old, pts = chat_scores.get(u.id, (name, 0))
+            chat_scores[u.id] = (name, pts + 1)
+            await message.reply(
+                f"🎉 <b>{html.escape(name)}</b> угадал(а)!\n"
+                f"Слово: <b>{g['word']}</b>\n"
+                f"🏆 Очков: <b>{pts + 1}</b>",
+                parse_mode="HTML",
+                reply_markup=lead_kb(),
+            )
+        return
+
+    await maybe_mimic(message)
+
+
+# ---------------------------------------------------------------- ЗАПУСК
+async def health(_request):
+    return web.Response(text="ok")
+
+
+async def setup_commands(bot: Bot):
+    """Список команд, который Telegram показывает при вводе «/»."""
+    common = [
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="xo", description="Крестики-нолики"),
+        BotCommand(command="croc", description="Крокодил"),
+        BotCommand(command="top", description="Топ крокодила"),
+        BotCommand(command="server", description="Статус сервера"),
+        BotCommand(command="online", description="Онлайн по серверам"),
+        BotCommand(command="profile", description="Профиль и префикс"),
+        BotCommand(command="ping", description="Скорость ответа бота"),
+    ]
+    admin = common + [
+        BotCommand(command="mute", description="Мут (ответом на сообщение)"),
+        BotCommand(command="unmute", description="Снять мут"),
+        BotCommand(command="ban", description="Бан"),
+        BotCommand(command="unban", description="Разбан"),
+        BotCommand(command="kick", description="Исключить"),
+        BotCommand(command="giveprefix", description="Выдать префикс"),
+        BotCommand(command="removeprefix", description="Снять префикс"),
+        BotCommand(command="monitoringon", description="Включить мониторинг"),
+        BotCommand(command="monitoringoff", description="Выключить мониторинг"),
+        BotCommand(command="mimicon", description="Включить кривляние"),
+        BotCommand(command="mimicoff", description="Выключить кривляние"),
+    ]
+    try:
+        await bot.set_my_commands(common, scope=BotCommandScopeAllGroupChats())
+        await bot.set_my_commands(admin, scope=BotCommandScopeAllChatAdministrators())
+        await bot.set_my_commands([BotCommand(command="start", description="О боте")])
+    except Exception:
+        logging.exception("не удалось установить список команд")
+
+
+async def main():
+    bot = Bot(TOKEN)
+
+    # мини-сервер, чтобы бесплатный хостинг видел открытый порт
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
+
+    await setup_commands(bot)
+    asyncio.create_task(monitor_loop(bot))
+    asyncio.create_task(keepalive_loop())
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
