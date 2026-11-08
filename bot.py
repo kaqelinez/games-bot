@@ -1,11 +1,17 @@
 import asyncio
+import html
 import logging
 import os
 import random
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import CallbackQuery, Message
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.filters import Command, CommandObject
+from aiogram.types import CallbackQuery, ChatPermissions, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiohttp import web
 
@@ -14,6 +20,8 @@ logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
     raise SystemExit("Не задана переменная окружения BOT_TOKEN")
+
+DB_PATH = os.getenv("DB_PATH", "bot.db")
 
 dp = Dispatcher()
 GROUPS = F.chat.type.in_({"group", "supergroup"})
@@ -34,12 +42,459 @@ async def private_any(message: Message):
 @dp.message(GROUPS, Command("start", "games", "help"))
 async def games_menu(message: Message):
     await message.answer(
-        "🎮 <b>Игры</b>\n\n"
-        "❌⭕ /xo — крестики-нолики (2 игрока)\n"
-        "🐊 /croc — крокодил\n"
-        "🏆 /top — счёт в крокодиле\n\n"
-        "Чтобы крокодил видел ваши ответы, у бота должен быть "
-        "отключён Privacy Mode (@BotFather → /setprivacy → Disable).",
+        "🎮 <b>Игры</b>\n"
+        "❌⭕ /xo — крестики-нолики\n"
+        "🐊 /croc — крокодил, 🏆 /top — счёт крокодила\n\n"
+        "💰 <b>Экономика</b>\n"
+        "/balance — баланс\n"
+        "/farm — фармить монеты (раз в час)\n"
+        "/daily — ежедневный бонус\n"
+        "/upgrade — улучшить ферму\n"
+        "/pay сумма — перевод (ответом на сообщение)\n"
+        "/rich — самые богатые\n\n"
+        "🏷 <b>Префиксы</b>\n"
+        "/prefixes — список, /buyprefix номер — купить, /noprefix — снять\n\n"
+        "🛡 <b>Для админов</b>\n"
+        "/mute [30m|2h|1d] — мут (ответом)\n"
+        "/unmute, /ban, /unban, /kick — ответом на сообщение\n"
+        "/giveprefix текст — выдать свой префикс (ответом)\n\n"
+        "Для крокодила у бота должен быть отключён Privacy Mode, "
+        "а для мута/бана бот должен быть админом группы.",
+        parse_mode="HTML",
+    )
+
+
+# ---------------------------------------------------------------- БАЗА ДАННЫХ
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.execute(
+    """CREATE TABLE IF NOT EXISTS users(
+        chat_id INTEGER, user_id INTEGER, name TEXT,
+        balance INTEGER DEFAULT 0, farm_level INTEGER DEFAULT 1,
+        last_farm INTEGER DEFAULT 0, last_daily INTEGER DEFAULT 0,
+        prefix TEXT DEFAULT '',
+        PRIMARY KEY(chat_id, user_id))"""
+)
+db.execute(
+    """CREATE TABLE IF NOT EXISTS owned(
+        chat_id INTEGER, user_id INTEGER, idx INTEGER,
+        PRIMARY KEY(chat_id, user_id, idx))"""
+)
+db.commit()
+
+FARM_CD = 3600          # секунд между /farm
+DAILY_CD = 86400
+DAILY_BONUS = 300
+
+PREFIXES = [
+    ("🌱 Новичок", 0),
+    ("🌾 Фермер", 1000),
+    ("⭐ Звезда", 5000),
+    ("💎 Мажор", 20000),
+    ("👑 Король", 100000),
+]
+
+
+def get_user(chat_id: int, user):
+    db.execute(
+        "INSERT OR IGNORE INTO users(chat_id, user_id, name) VALUES(?,?,?)",
+        (chat_id, user.id, user.full_name),
+    )
+    db.execute(
+        "UPDATE users SET name=? WHERE chat_id=? AND user_id=?",
+        (user.full_name, chat_id, user.id),
+    )
+    db.commit()
+    return db.execute(
+        "SELECT * FROM users WHERE chat_id=? AND user_id=?",
+        (chat_id, user.id),
+    ).fetchone()
+
+
+def set_field(chat_id: int, user_id: int, **fields):
+    cols = ", ".join(f"{k}=?" for k in fields)
+    db.execute(
+        f"UPDATE users SET {cols} WHERE chat_id=? AND user_id=?",
+        (*fields.values(), chat_id, user_id),
+    )
+    db.commit()
+
+
+def disp(row) -> str:
+    name = html.escape(row["name"] or "Игрок")
+    return f"{html.escape(row['prefix'])} {name}" if row["prefix"] else name
+
+
+def fmt_time(sec: int) -> str:
+    m, s = divmod(max(sec, 0), 60)
+    h, m = divmod(m, 60)
+    parts = []
+    if h:
+        parts.append(f"{h} ч")
+    if m:
+        parts.append(f"{m} мин")
+    if not h and not m:
+        parts.append(f"{s} сек")
+    return " ".join(parts)
+
+
+# ---------------------------------------------------------------- ЭКОНОМИКА
+@dp.message(GROUPS, Command("balance", "bal"))
+async def cmd_balance(message: Message):
+    target = message.reply_to_message.from_user if (
+        message.reply_to_message and message.reply_to_message.from_user
+        and not message.reply_to_message.from_user.is_bot
+    ) else message.from_user
+    r = get_user(message.chat.id, target)
+    await message.reply(
+        f"👤 {disp(r)}\n"
+        f"💰 Баланс: <b>{r['balance']}</b> 🪙\n"
+        f"🌾 Уровень фермы: <b>{r['farm_level']}</b>",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GROUPS, Command("farm"))
+async def cmd_farm(message: Message):
+    cid, u = message.chat.id, message.from_user
+    r = get_user(cid, u)
+    now = int(time.time())
+    left = r["last_farm"] + FARM_CD - now
+    if left > 0:
+        await message.reply(f"⏳ Ферма отдыхает. Подожди {fmt_time(left)}.")
+        return
+    gain = random.randint(40, 100) * r["farm_level"]
+    set_field(cid, u.id, balance=r["balance"] + gain, last_farm=now)
+    await message.reply(
+        f"🌾 Ты собрал урожай: <b>+{gain}</b> 🪙\n"
+        f"Баланс: <b>{r['balance'] + gain}</b> 🪙",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GROUPS, Command("daily"))
+async def cmd_daily(message: Message):
+    cid, u = message.chat.id, message.from_user
+    r = get_user(cid, u)
+    now = int(time.time())
+    left = r["last_daily"] + DAILY_CD - now
+    if left > 0:
+        await message.reply(f"⏳ Бонус уже получен. Следующий через {fmt_time(left)}.")
+        return
+    set_field(cid, u.id, balance=r["balance"] + DAILY_BONUS, last_daily=now)
+    await message.reply(
+        f"🎁 Ежедневный бонус: <b>+{DAILY_BONUS}</b> 🪙", parse_mode="HTML"
+    )
+
+
+@dp.message(GROUPS, Command("upgrade"))
+async def cmd_upgrade(message: Message):
+    cid, u = message.chat.id, message.from_user
+    r = get_user(cid, u)
+    cost = r["farm_level"] * 500
+    if r["balance"] < cost:
+        await message.reply(
+            f"❌ Улучшение до уровня {r['farm_level'] + 1} стоит {cost} 🪙, "
+            f"у тебя {r['balance']}."
+        )
+        return
+    set_field(cid, u.id, balance=r["balance"] - cost, farm_level=r["farm_level"] + 1)
+    await message.reply(
+        f"⬆️ Ферма улучшена до уровня <b>{r['farm_level'] + 1}</b>!\n"
+        f"Теперь /farm приносит больше.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GROUPS, Command("pay"))
+async def cmd_pay(message: Message, command: CommandObject):
+    cid, u = message.chat.id, message.from_user
+    rep = message.reply_to_message
+    if not rep or not rep.from_user or rep.from_user.is_bot:
+        await message.reply("Ответь командой на сообщение игрока: /pay 100")
+        return
+    if rep.from_user.id == u.id:
+        await message.reply("Нельзя переводить самому себе 🙂")
+        return
+    if not command.args or not command.args.strip().isdigit():
+        await message.reply("Укажи сумму числом: /pay 100")
+        return
+    amount = int(command.args.strip())
+    if amount <= 0:
+        await message.reply("Сумма должна быть больше нуля.")
+        return
+    me = get_user(cid, u)
+    if me["balance"] < amount:
+        await message.reply(f"❌ Не хватает монет. Баланс: {me['balance']} 🪙")
+        return
+    other = get_user(cid, rep.from_user)
+    set_field(cid, u.id, balance=me["balance"] - amount)
+    set_field(cid, rep.from_user.id, balance=other["balance"] + amount)
+    await message.reply(
+        f"✅ {disp(me)} перевёл {disp(other)} <b>{amount}</b> 🪙",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GROUPS, Command("rich"))
+async def cmd_rich(message: Message):
+    rows = db.execute(
+        "SELECT * FROM users WHERE chat_id=? AND balance>0 "
+        "ORDER BY balance DESC LIMIT 10",
+        (message.chat.id,),
+    ).fetchall()
+    if not rows:
+        await message.answer("Пока ни у кого нет монет. Начни с /farm 🌾")
+        return
+    lines = [f"{i}. {disp(r)} — {r['balance']} 🪙" for i, r in enumerate(rows, 1)]
+    await message.answer(
+        "💰 <b>Самые богатые</b>\n\n" + "\n".join(lines), parse_mode="HTML"
+    )
+
+
+# ---------------------------------------------------------------- ПРЕФИКСЫ
+@dp.message(GROUPS, Command("prefixes"))
+async def cmd_prefixes(message: Message):
+    cid, u = message.chat.id, message.from_user
+    get_user(cid, u)
+    owned = {
+        row["idx"]
+        for row in db.execute(
+            "SELECT idx FROM owned WHERE chat_id=? AND user_id=?", (cid, u.id)
+        )
+    }
+    lines = []
+    for i, (name, price) in enumerate(PREFIXES, 1):
+        mark = " ✅" if (i - 1) in owned else ""
+        lines.append(f"{i}. {name} — {price} 🪙{mark}")
+    await message.reply(
+        "🏷 <b>Префиксы</b>\n\n" + "\n".join(lines) +
+        "\n\nКупить: /buyprefix номер\nСнять: /noprefix",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GROUPS, Command("buyprefix"))
+async def cmd_buyprefix(message: Message, command: CommandObject):
+    cid, u = message.chat.id, message.from_user
+    r = get_user(cid, u)
+    if not command.args or not command.args.strip().isdigit():
+        await message.reply("Напиши номер: /buyprefix 2 (список: /prefixes)")
+        return
+    n = int(command.args.strip())
+    if not 1 <= n <= len(PREFIXES):
+        await message.reply("Такого номера нет. Смотри /prefixes")
+        return
+    name, price = PREFIXES[n - 1]
+    has = db.execute(
+        "SELECT 1 FROM owned WHERE chat_id=? AND user_id=? AND idx=?",
+        (cid, u.id, n - 1),
+    ).fetchone()
+    if has:
+        set_field(cid, u.id, prefix=name)
+        await message.reply(f"✅ Префикс «{name}» надет.")
+        return
+    if r["balance"] < price:
+        await message.reply(
+            f"❌ Нужно {price} 🪙, у тебя {r['balance']}."
+        )
+        return
+    db.execute(
+        "INSERT OR IGNORE INTO owned(chat_id, user_id, idx) VALUES(?,?,?)",
+        (cid, u.id, n - 1),
+    )
+    db.commit()
+    set_field(cid, u.id, balance=r["balance"] - price, prefix=name)
+    await message.reply(f"🎉 Куплен и надет префикс «{name}»!")
+
+
+@dp.message(GROUPS, Command("noprefix"))
+async def cmd_noprefix(message: Message):
+    get_user(message.chat.id, message.from_user)
+    set_field(message.chat.id, message.from_user.id, prefix="")
+    await message.reply("Префикс снят.")
+
+
+# ---------------------------------------------------------------- МОДЕРАЦИЯ
+async def require_admin(message: Message) -> bool:
+    m = await message.bot.get_chat_member(message.chat.id, message.from_user.id)
+    if m.status not in ("creator", "administrator"):
+        await message.reply("⛔ Эта команда только для админов чата.")
+        return False
+    return True
+
+
+def reply_target(message: Message):
+    rep = message.reply_to_message
+    if rep and rep.from_user and not rep.from_user.is_bot:
+        return rep.from_user
+    return None
+
+
+def parse_duration(args):
+    if not args:
+        return timedelta(minutes=10)
+    m = re.fullmatch(r"(\d+)\s*([mhdмчд]?)", args.strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2) or "m"
+    if n <= 0:
+        return None
+    if unit in ("h", "ч"):
+        d = timedelta(hours=n)
+    elif unit in ("d", "д"):
+        d = timedelta(days=n)
+    else:
+        d = timedelta(minutes=n)
+    return min(d, timedelta(days=365))
+
+
+async def mod_error(message: Message, e: Exception):
+    text = getattr(e, "message", str(e))
+    await message.reply(
+        f"❌ Не получилось: {text}\n"
+        "Проверь, что бот — админ группы с правом ограничивать/банить участников, "
+        "и что цель — не админ."
+    )
+
+
+@dp.message(GROUPS, Command("mute"))
+async def cmd_mute(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /mute 30m")
+        return
+    delta = parse_duration(command.args)
+    if delta is None:
+        await message.reply("Формат: /mute 30m, /mute 2h, /mute 1d (по умолчанию 10 минут)")
+        return
+    until = datetime.now(timezone.utc) + delta
+    try:
+        await message.bot.restrict_chat_member(
+            message.chat.id,
+            t.id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until,
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    mins = int(delta.total_seconds() // 60)
+    await message.reply(
+        f"🔇 {html.escape(t.full_name)} в муте на {fmt_time(mins * 60)}.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(GROUPS, Command("unmute"))
+async def cmd_unmute(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /unmute")
+        return
+    try:
+        await message.bot.restrict_chat_member(
+            message.chat.id,
+            t.id,
+            permissions=ChatPermissions(
+                can_send_messages=True,
+                can_send_audios=True,
+                can_send_documents=True,
+                can_send_photos=True,
+                can_send_videos=True,
+                can_send_video_notes=True,
+                can_send_voice_notes=True,
+                can_send_polls=True,
+                can_send_other_messages=True,
+                can_add_web_page_previews=True,
+                can_invite_users=True,
+            ),
+        )
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply(
+        f"🔊 {html.escape(t.full_name)} размучен.", parse_mode="HTML"
+    )
+
+
+@dp.message(GROUPS, Command("ban"))
+async def cmd_ban(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /ban")
+        return
+    try:
+        await message.bot.ban_chat_member(message.chat.id, t.id)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply(
+        f"🔨 {html.escape(t.full_name)} забанен.", parse_mode="HTML"
+    )
+
+
+@dp.message(GROUPS, Command("unban"))
+async def cmd_unban(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    uid = t.id if t else None
+    if uid is None and command.args and command.args.strip().isdigit():
+        uid = int(command.args.strip())
+    if uid is None:
+        await message.reply("Ответь командой на сообщение или укажи ID: /unban 123456")
+        return
+    try:
+        await message.bot.unban_chat_member(message.chat.id, uid, only_if_banned=True)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply("✅ Пользователь разбанен, может вернуться по ссылке.")
+
+
+@dp.message(GROUPS, Command("kick"))
+async def cmd_kick(message: Message):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    if not t:
+        await message.reply("Ответь командой на сообщение участника: /kick")
+        return
+    try:
+        await message.bot.ban_chat_member(message.chat.id, t.id)
+        await message.bot.unban_chat_member(message.chat.id, t.id, only_if_banned=True)
+    except (TelegramBadRequest, TelegramForbiddenError) as e:
+        await mod_error(message, e)
+        return
+    await message.reply(
+        f"👢 {html.escape(t.full_name)} исключён.", parse_mode="HTML"
+    )
+
+
+@dp.message(GROUPS, Command("giveprefix"))
+async def cmd_giveprefix(message: Message, command: CommandObject):
+    if not await require_admin(message):
+        return
+    t = reply_target(message)
+    text = (command.args or "").strip()
+    if not t or not text:
+        await message.reply("Ответь на сообщение участника: /giveprefix 🔥 Легенда")
+        return
+    if len(text) > 20:
+        await message.reply("Префикс слишком длинный (максимум 20 символов).")
+        return
+    get_user(message.chat.id, t)
+    set_field(message.chat.id, t.id, prefix=text)
+    await message.reply(
+        f"🏷 {html.escape(t.full_name)} получил префикс «{html.escape(text)}».",
         parse_mode="HTML",
     )
 
@@ -166,7 +621,9 @@ WORDS = [
     "зомби", "бумеранг", "кенгуру", "лыжи", "скейтборд", "привидение",
 ]
 
-croc: dict[int, dict] = {}       # chat_id -> состояние игры
+CROC_REWARD = 100
+
+croc: dict[int, dict] = {}         # chat_id -> состояние игры
 croc_scores: dict[int, dict] = {}  # chat_id -> {user_id: (name, очки)}
 
 
@@ -193,7 +650,10 @@ def game_kb():
 async def croc_start(message: Message):
     g = croc.get(message.chat.id)
     if g and g["active"]:
-        await message.answer(f"Игра уже идёт, ведущий — {g['leader'][1]} 🐊")
+        await message.answer(
+            f"Игра уже идёт, ведущий — {html.escape(g['leader'][1])} 🐊",
+            parse_mode="HTML",
+        )
         return
     await message.answer(
         "🐊 <b>Крокодил</b>\nКто объясняет слово?",
@@ -216,9 +676,9 @@ async def croc_lead(cb: CallbackQuery):
         "word": random.choice(WORDS),
     }
     await cb.message.edit_text(
-        f"🐊 Ведущий: <b>{u.full_name}</b>\n\n"
+        f"🐊 Ведущий: <b>{html.escape(u.full_name)}</b>\n\n"
         "Нажми «Посмотреть слово» и объясняй его без однокоренных слов.\n"
-        "Остальные — пишите ответы прямо в чат!",
+        f"Остальные — пишите ответы прямо в чат! Награда: {CROC_REWARD} 🪙",
         parse_mode="HTML",
         reply_markup=game_kb(),
     )
@@ -261,8 +721,12 @@ async def croc_top(message: Message):
         await message.answer("Пока нет очков. Сыграйте в /croc 🐊")
         return
     top = sorted(scores.values(), key=lambda x: x[1], reverse=True)[:10]
-    lines = [f"{i}. {n} — {s}" for i, (n, s) in enumerate(top, 1)]
-    await message.answer("🏆 <b>Топ крокодила</b>\n\n" + "\n".join(lines), parse_mode="HTML")
+    lines = [
+        f"{i}. {html.escape(n)} — {s}" for i, (n, s) in enumerate(top, 1)
+    ]
+    await message.answer(
+        "🏆 <b>Топ крокодила</b>\n\n" + "\n".join(lines), parse_mode="HTML"
+    )
 
 
 # Ловим ответы игроков (обычные текстовые сообщения, не команды)
@@ -282,9 +746,13 @@ async def croc_guess(message: Message):
     name, pts = chat_scores.get(u.id, (u.full_name, 0))
     chat_scores[u.id] = (u.full_name, pts + 1)
 
+    # награда монетами
+    r = get_user(message.chat.id, u)
+    set_field(message.chat.id, u.id, balance=r["balance"] + CROC_REWARD)
+
     await message.reply(
-        f"🎉 <b>{u.full_name}</b> угадал(а)! Слово: <b>{g['word']}</b>\n"
-        f"Очков: {pts + 1}",
+        f"🎉 <b>{html.escape(u.full_name)}</b> угадал(а)! Слово: <b>{g['word']}</b>\n"
+        f"Очков: {pts + 1}, награда: +{CROC_REWARD} 🪙",
         parse_mode="HTML",
         reply_markup=lead_kb(),
     )
