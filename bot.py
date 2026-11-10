@@ -100,6 +100,10 @@ db.execute(
         chat_id INTEGER, user_id INTEGER, name TEXT DEFAULT '',
         PRIMARY KEY(chat_id, user_id))"""
 )
+db.execute(
+    """CREATE TABLE IF NOT EXISTS blocked_users(
+        user_id INTEGER PRIMARY KEY, name TEXT DEFAULT '')"""
+)
 db.commit()
 
 SETTING_DEFAULTS = {"monitoring": True, "mimic": False}
@@ -570,6 +574,20 @@ def is_bot_admin(chat_id: int, user_id: int) -> bool:
     ).fetchone() is not None
 
 
+ENV_BLOCKED_USERS = {
+    int(x) for x in os.getenv("BLOCKED_USERS", "").replace(" ", "").split(",")
+    if x.isdigit()
+}
+
+
+def is_user_blocked(user_id: int) -> bool:
+    if user_id in ENV_BLOCKED_USERS:
+        return True
+    return db.execute(
+        "SELECT 1 FROM blocked_users WHERE user_id=?", (user_id,)
+    ).fetchone() is not None
+
+
 def resolve_chat(arg: str):
     """Номер из списка /groups (1, 2, 3…) или ID чата. None, если не подошло."""
     arg = arg.strip()
@@ -613,6 +631,14 @@ class GateMiddleware(BaseMiddleware):
     """Игнорирует заблокированные группы и отключённые команды."""
 
     async def __call__(self, handler, event, data):
+        user = getattr(event, "from_user", None)
+        if user is not None and user.id not in OWNER_IDS and is_user_blocked(user.id):
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer()
+                except Exception:
+                    pass
+            return None
         msg = event if isinstance(event, Message) else getattr(event, "message", None)
         chat = getattr(msg, "chat", None)
         if chat is not None and chat.type in ("group", "supergroup"):
@@ -695,6 +721,10 @@ OWNER_HELP = (
     "🔕 /disable команда номер — отключить команду в группе\n"
     "🔔 /enable команда номер — включить обратно\n"
     "📃 /disabled номер — что отключено\n"
+    "🙅 /blockuser — запретить человеку пользоваться ботом (ответом или по ID)\n"
+    "✅ /unblockuser — разблокировать человека\n"
+    "📃 /blockedusers — список заблокированных людей\n"
+    "♻️ /restart — перезапустить бота\n"
     "🧾 /logs — логи бота\n"
     "🆔 /myid — твой ID\n\n"
     "Номер — из списка /groups, либо можно указать ID группы."
@@ -706,6 +736,35 @@ async def cmd_owner(message: Message):
     if not await owner_only(message):
         return
     await message.answer(OWNER_HELP, parse_mode="HTML")
+
+
+@dp.message(F.chat.type == "private", Command("restart"))
+async def cmd_restart(message: Message):
+    if not await owner_only(message):
+        return
+    await message.answer(
+        "♻️ <b>Перезапустить бота?</b>\n\n"
+        "Он будет недоступен 1–2 минуты. Данные в памяти (идущие игры) "
+        "сбросятся, а на бесплатном Render могут сброситься и настройки.",
+        parse_mode="HTML",
+        reply_markup=markup([[btn("✅ Да, перезапустить", "rs:yes"), btn("❌ Отмена", "rs:no")]]),
+    )
+
+
+@dp.callback_query(F.data.in_({"rs:yes", "rs:no"}))
+async def cb_restart(cb: CallbackQuery):
+    if cb.from_user.id not in OWNER_IDS:
+        await cb.answer("⛔ Только для владельца бота", show_alert=True)
+        return
+    if cb.data == "rs:no":
+        await cb.message.edit_text("Отменено ✅")
+        await cb.answer()
+        return
+    await cb.message.edit_text("♻️ Перезапускаюсь… вернусь через 1–2 минуты.")
+    await cb.answer()
+    logging.warning("перезапуск по команде владельца %s", cb.from_user.id)
+    await asyncio.sleep(2)  # даём Telegram отметить обновление как обработанное
+    os._exit(1)  # Render сам запустит сервис заново
 
 
 @dp.message(F.chat.type == "private", Command("groups"))
@@ -800,6 +859,76 @@ async def cmd_say(message: Message, command: CommandObject):
         await message.reply(f"❌ Не отправилось: {e}")
         return
     await message.reply(f"✅ Отправлено в «{group_title(chat_id)}».")
+
+
+@dp.message(Command("blockuser"))
+async def cmd_blockuser(message: Message, command: CommandObject):
+    if not await owner_only(message):
+        return
+    t = reply_target(message)
+    uid, name = None, ""
+    if t:
+        uid, name = t.id, t.full_name
+    elif command.args and command.args.strip().isdigit():
+        uid = int(command.args.strip())
+    if uid is None:
+        await message.reply(
+            "Ответь командой на сообщение человека (в группе) или укажи ID: /blockuser 123456"
+        )
+        return
+    if uid in OWNER_IDS:
+        await message.reply("Себя заблокировать нельзя 🙂")
+        return
+    db.execute(
+        "INSERT OR REPLACE INTO blocked_users(user_id, name) VALUES(?,?)", (uid, name)
+    )
+    db.commit()
+    await message.reply(
+        f"🚫 {name or uid} ({uid}) заблокирован: бот игнорирует его во всех чатах.\n\n"
+        "Чтобы блокировка пережила перезапуск, добавь ID в переменную BLOCKED_USERS на Render."
+    )
+
+
+@dp.message(Command("unblockuser"))
+async def cmd_unblockuser(message: Message, command: CommandObject):
+    if not await owner_only(message):
+        return
+    t = reply_target(message)
+    uid = t.id if t else None
+    if uid is None and command.args and command.args.strip().isdigit():
+        uid = int(command.args.strip())
+    if uid is None:
+        await message.reply("Ответь командой на сообщение человека или укажи ID: /unblockuser 123456")
+        return
+    db.execute("DELETE FROM blocked_users WHERE user_id=?", (uid,))
+    db.commit()
+    extra = ""
+    if uid in ENV_BLOCKED_USERS:
+        extra = "\n⚠️ ID всё ещё указан в BLOCKED_USERS на Render — удали его оттуда."
+    await message.reply(f"✅ {uid} разблокирован.{extra}")
+
+
+@dp.message(Command("blockedusers"))
+async def cmd_blockedusers(message: Message):
+    if not await owner_only(message):
+        return
+    people = {
+        r["user_id"]: r["name"]
+        for r in db.execute("SELECT user_id, name FROM blocked_users")
+    }
+    for uid in ENV_BLOCKED_USERS:
+        people.setdefault(uid, "")
+    if not people:
+        await message.reply("Заблокированных людей нет ✅")
+        return
+    lines = [
+        f"🚫 {html.escape(name) if name else 'ID'} — <code>{uid}</code>"
+        for uid, name in people.items()
+    ]
+    await message.reply(
+        "🙅 <b>Заблокированные люди</b>\n\n" + "\n".join(lines)[:3500],
+        parse_mode="HTML",
+    )
 
 
 async def resolve_cmd_chat(message: Message, parts: list, need_cmd: bool):
@@ -1803,6 +1932,10 @@ async def setup_commands(bot: Bot):
         BotCommand(command="disable", description="Отключить команду в группе"),
         BotCommand(command="enable", description="Включить команду в группе"),
         BotCommand(command="disabled", description="Отключённые команды"),
+        BotCommand(command="blockuser", description="Заблокировать человека"),
+        BotCommand(command="unblockuser", description="Разблокировать человека"),
+        BotCommand(command="blockedusers", description="Список заблокированных людей"),
+        BotCommand(command="restart", description="Перезапустить бота"),
         BotCommand(command="logs", description="Логи бота"),
         BotCommand(command="myid", description="Мой ID"),
     ]
@@ -1830,6 +1963,8 @@ async def main():
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
 
     await setup_commands(bot)
+    if os.getenv("NOTIFY_START", "1") != "0":
+        await notify_owners(bot, "🟢 Бот запущен")
     asyncio.create_task(monitor_loop(bot))
     asyncio.create_task(keepalive_loop())
     await dp.start_polling(bot)
