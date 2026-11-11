@@ -803,7 +803,9 @@ class GateMiddleware(BaseMiddleware):
             elif isinstance(event, CallbackQuery) and event.data:
                 cmd = CB_TO_CMD.get(event.data) or (
                     "online" if event.data.startswith("o:")
-                    else "find" if event.data.startswith("f:") else None
+                    else "find" if event.data.startswith("f:")
+                    else "xo" if event.data.startswith("x:")
+                    else "croc" if event.data.startswith("c:") else None
                 )
             if cmd and is_disabled(chat.id, cmd):
                 if isinstance(event, Message):
@@ -1203,7 +1205,7 @@ async def private_any(message: Message):
 HELP_TEXT = (
     "❓ <b>Все команды</b>\n\n"
     "🎮 <b>Игры</b>\n"
-    "/xo, /croc — игры в мини-приложении, /top — счёт крокодила\n\n"
+    "/xo — крестики-нолики, /croc — крокодил, /top — счёт крокодила\n\n"
     "🖥 <b>Сервер</b>\n"
     "/server — статус anmine.ru\n"
     "/online — онлайн, /online 1 — ники\n"
@@ -1281,9 +1283,15 @@ async def cb_menu(cb: CallbackQuery):
     if action == "main":
         await safe_edit(cb, main_text(u), markup(MAIN_ROWS))
 
-    elif action in ("games", "xo", "croc"):
-        text, kb = await games_view(cb.bot, chat_id)
+    elif action == "games":
+        text, kb = games_view()
         await safe_edit(cb, text, kb)
+
+    elif action == "xo":
+        await start_xo(cb.message)
+
+    elif action == "croc":
+        await start_croc(cb.message)
 
     elif action == "top":
         await send_top(cb.message)
@@ -1665,185 +1673,293 @@ async def send_top(target: Message):
 @dp.message(GROUPS, Command("top"))
 async def cmd_top(message: Message):
     await send_top(message)
-# ---------------------------------------------------------------- МИНИ-ПРИЛОЖЕНИЕ (ИГРЫ)
-import hashlib
-import hmac
-import json
-from urllib.parse import parse_qsl
+# ---------------------------------------------------------------- ИГРЫ
+GAMES_TEXT = "🎮 <b>Игры</b>\n\nВыбери игру 👇"
+MAX_GAMES = 200
+ROUND_TTL = 15 * 60  # раунд крокодила без движения считается забытым
 
-MINIAPP_SHORT = os.getenv("MINIAPP_SHORT", "")  # короткое имя из BotFather /newapp
-INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
-rooms: dict[int, dict] = {}   # chat_id -> состояние игр чата (в памяти)
-member_cache: dict[tuple, float] = {}
+
+def games_view():
+    return GAMES_TEXT, markup([
+        [btn("❌⭕ Крестики-нолики", "m:xo"), btn("🐊 Крокодил", "m:croc")],
+        [btn("🏆 Топ крокодила", "m:top")],
+        HOME,
+    ])
+
+
+@dp.message(GROUPS, Command("games"))
+async def cmd_games_menu(message: Message):
+    text, kb = games_view()
+    await message.answer(text, parse_mode="HTML", reply_markup=kb)
+
+
+# ---------------- крестики-нолики
 XO_LINES = [(0, 1, 2), (3, 4, 5), (6, 7, 8), (0, 3, 6), (1, 4, 7), (2, 5, 8), (0, 4, 8), (2, 4, 6)]
+xo_games: dict[tuple, dict] = {}  # (chat_id, message_id) -> партия
 
 
-async def app_link(bot: Bot, chat_id: int):
-    if not MINIAPP_SHORT:
-        return None
-    me = await bot.me()
-    return f"https://t.me/{me.username}/{MINIAPP_SHORT}?startapp={str(chat_id).replace('-', 'm')}"
-
-
-async def games_view(bot: Bot, chat_id: int):
-    url = await app_link(bot, chat_id)
-    if not url:
-        return ("🎮 <b>Игры</b>\n\nМини-приложение не настроено: "
-                "владельцу нужно задать MINIAPP_SHORT.", markup([HOME]))
-    return (
-        "🎮 <b>Игры</b>\n\nКрестики-нолики и крокодил — в мини-приложении 👇",
-        markup([[InlineKeyboardButton(text="🎮 Открыть игры", url=url)],
-                [btn("🏆 Топ крокодила", "m:top")], HOME]),
-    )
-
-
-@dp.message(GROUPS, Command("xo", "croc"))
-async def cmd_games(message: Message):
-    text, kb = await games_view(message.bot, message.chat.id)
-    await message.reply(text, parse_mode="HTML", reply_markup=kb)
-
-
-def check_init(init: str):
-    """Проверяет подпись Telegram. Возвращает (user, chat_id) или None."""
-    try:
-        data = dict(parse_qsl(init, keep_blank_values=True))
-        got = data.pop("hash", "")
-        dcs = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
-        key = hmac.new(b"WebAppData", TOKEN.encode(), hashlib.sha256).digest()
-        calc = hmac.new(key, dcs.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(calc, got):
-            return None
-        if time.time() - int(data.get("auth_date", 0)) > 86400:
-            return None
-        sp = data.get("start_param", "")
-        if not re.fullmatch(r"m?\d+", sp):
-            return None
-        return json.loads(data["user"]), int(sp.replace("m", "-"))
-    except Exception:
-        return None
-
-
-def new_xo(players=None):
-    return {"b": [""] * 9, "p": players or {}, "turn": "X", "win": None}
-
-
-def get_room(chat_id: int) -> dict:
-    return rooms.setdefault(chat_id, {
-        "xo": new_xo(),
-        "croc": {"active": False, "leader": None, "word": "", "log": [], "msg": ""},
-    })
+def new_xo(players=None) -> dict:
+    return {"b": [""] * 9, "p": players or {}, "turn": "X", "win": None, "line": ()}
 
 
 def xo_result(b):
-    for a, c, d in XO_LINES:
+    for line in XO_LINES:
+        a, c, d = line
         if b[a] and b[a] == b[c] == b[d]:
-            return b[a]
-    return "draw" if all(b) else None
+            return b[a], line
+    return ("draw", ()) if all(b) else (None, ())
 
 
-async def say(bot: Bot, chat_id: int, text: str):
+def xo_text(g: dict) -> str:
+    x, o = g["p"].get("X"), g["p"].get("O")
+    px = html.escape(x[1]) if x else "—"
+    po = html.escape(o[1]) if o else "—"
+    if g["win"] == "draw":
+        tail = "🤝 <b>Ничья!</b>"
+    elif g["win"]:
+        tail = f"🔥 <b>Победил(а) {html.escape(g['p'][g['win']][1])}!</b>"
+    elif not x:
+        tail = "Нажми на любую клетку — ты играешь ❌."
+    elif not o:
+        tail = "Ждём соперника: пусть нажмёт на любую клетку (он будет ⭕)."
+    else:
+        sym = g["turn"]
+        tail = f"Ход: {'❌' if sym == 'X' else '⭕'} {html.escape(g['p'][sym][1])}"
+    return f"❌⭕ <b>Крестики-нолики</b>\n\n❌ {px}\n⭕ {po}\n\n{tail}"
+
+
+def xo_kb(g: dict) -> InlineKeyboardMarkup:
+    rows = []
+    for r in range(3):
+        row = []
+        for c in range(3):
+            i = r * 3 + c
+            v = g["b"][i]
+            if g["win"] in ("X", "O") and i in g["line"]:
+                t = "🟥" if v == "X" else "🟦"
+            else:
+                t = "❌" if v == "X" else "⭕" if v == "O" else "▫️"
+            row.append(btn(t, f"x:{i}"))
+        rows.append(row)
+    if g["win"]:
+        rows.append([btn("🔄 Реванш", "x:new"), btn("🏠 Меню", "m:main")])
+    else:
+        rows.append([btn("🏳️ Закончить", "x:stop")])
+    return markup(rows)
+
+
+async def start_xo(target: Message):
+    g = new_xo()
+    m = await target.answer(xo_text(g), parse_mode="HTML", reply_markup=xo_kb(g))
+    xo_games[(target.chat.id, m.message_id)] = g
+    while len(xo_games) > MAX_GAMES:
+        xo_games.pop(next(iter(xo_games)))
+
+
+@dp.message(GROUPS, Command("xo"))
+async def cmd_xo(message: Message):
+    await start_xo(message)
+
+
+@dp.callback_query(F.data.startswith("x:"))
+async def cb_xo(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    g = xo_games.get((chat_id, cb.message.message_id))
+    if g is None:
+        await cb.answer("Эта игра устарела. Начни новую: /xo", show_alert=True)
+        return
+    u = cb.from_user
+    name = label(chat_id, u)
+    ids = {p[0] for p in g["p"].values()}
+    act = cb.data[2:]
+
+    if act == "new":
+        if not g["win"] or u.id not in ids:
+            await cb.answer("Реванш — только для игроков после партии")
+            return
+        g.update(new_xo(g["p"]))
+    elif act == "stop":
+        if u.id not in ids:
+            await cb.answer("Ты не участвуешь в этой партии")
+            return
+        xo_games.pop((chat_id, cb.message.message_id), None)
+        await safe_edit(cb, "🏁 Партия остановлена.",
+                        markup([[btn("❌⭕ Новая игра", "m:xo")], HOME]))
+        await cb.answer()
+        return
+    else:
+        try:
+            i = int(act)
+        except ValueError:
+            await cb.answer()
+            return
+        if g["win"]:
+            await cb.answer("Партия окончена — жми «Реванш»")
+            return
+        if not 0 <= i < 9 or g["b"][i]:
+            await cb.answer("Клетка занята")
+            return
+        sym = g["turn"]
+        cur = g["p"].get(sym)
+        if cur is None:
+            if u.id in ids:
+                await cb.answer("Ждём соперника 🙂")
+                return
+            g["p"][sym] = [u.id, name]
+        elif cur[0] != u.id:
+            await cb.answer("Сейчас не твой ход" if u.id in ids else "Ты не участвуешь в этой партии")
+            return
+        g["b"][i] = sym
+        res, line = xo_result(g["b"])
+        if res:
+            g["win"], g["line"] = res, line
+        else:
+            g["turn"] = "O" if sym == "X" else "X"
+
+    await safe_edit(cb, xo_text(g), xo_kb(g))
+    await cb.answer()
+
+
+# ---------------- крокодил
+def croc_idle_kb() -> InlineKeyboardMarkup:
+    return markup([
+        [btn("🎤 Стать ведущим", "c:lead")],
+        [btn("🏆 Топ крокодила", "m:top"), btn("🏠 Меню", "m:main")],
+    ])
+
+
+CROC_RULES = (
+    "🐊 <b>Крокодил</b>\n\n"
+    "Ведущий получает слово и объясняет его в чате — без называния самого слова. "
+    "Остальные пишут варианты обычными сообщениями. Кто угадает — получает очко."
+)
+
+
+def croc_active_text(g: dict) -> str:
+    return (
+        "🐊 <b>Крокодил</b>\n\n"
+        f"🎤 Ведущий: <b>{html.escape(g['leader'][1])}</b>\n\n"
+        "Угадывайте слово — пишите варианты в чат 👇\n"
+        "<i>Ведущий жмёт «Слово», чтобы посмотреть его.</i>"
+    )
+
+
+def croc_active_kb() -> InlineKeyboardMarkup:
+    return markup([
+        [btn("👁 Слово", "c:show")],
+        [btn("🔄 Другое слово", "c:new"), btn("🏳️ Сдаться", "c:giveup")],
+    ])
+
+
+def croc_is_live(chat_id: int) -> bool:
+    g = croc.get(chat_id)
+    if g and time.time() - g["t"] > ROUND_TTL:
+        croc.pop(chat_id, None)
+        return False
+    return g is not None
+
+
+async def start_croc(target: Message):
+    if croc_is_live(target.chat.id):
+        g = croc[target.chat.id]
+        await target.answer(f"🐊 Раунд уже идёт. Ведущий: {html.escape(g['leader'][1])}", parse_mode="HTML")
+        return
+    await target.answer(CROC_RULES, parse_mode="HTML", reply_markup=croc_idle_kb())
+
+
+@dp.message(GROUPS, Command("croc"))
+async def cmd_croc(message: Message):
+    await start_croc(message)
+
+
+@dp.callback_query(F.data.startswith("c:"))
+async def cb_croc(cb: CallbackQuery):
+    chat_id = cb.message.chat.id
+    u = cb.from_user
+    act = cb.data[2:]
+
+    if act == "lead":
+        if croc_is_live(chat_id):
+            await cb.answer("Раунд уже идёт", show_alert=True)
+            return
+        g = {"leader": [u.id, label(chat_id, u)], "word": random.choice(WORDS),
+             "msg": cb.message.message_id, "t": time.time()}
+        croc[chat_id] = g
+        await safe_edit(cb, croc_active_text(g), croc_active_kb())
+        await cb.answer(f"Твоё слово: {g['word']}", show_alert=True)
+        return
+
+    g = croc.get(chat_id)
+    if g is None or g["msg"] != cb.message.message_id:
+        await cb.answer("Этот раунд уже закончился", show_alert=True)
+        return
+    if g["leader"][0] != u.id:
+        await cb.answer("Это кнопки ведущего 🙂", show_alert=True)
+        return
+
+    g["t"] = time.time()
+    if act == "show":
+        await cb.answer(f"Твоё слово: {g['word']}", show_alert=True)
+    elif act == "new":
+        old = g["word"]
+        while g["word"] == old:
+            g["word"] = random.choice(WORDS)
+        await cb.answer(f"Новое слово: {g['word']}", show_alert=True)
+    elif act == "giveup":
+        croc.pop(chat_id, None)
+        await safe_edit(
+            cb,
+            f"🏳️ Ведущий сдался. Слово было: <b>{html.escape(g['word'])}</b>",
+            croc_idle_kb(),
+        )
+        await cb.answer()
+    else:
+        await cb.answer()
+
+
+async def croc_try(message: Message) -> bool:
+    """Проверяет сообщение в чате как вариант слова в крокодиле. True — сообщение обработано."""
+    chat_id = message.chat.id
+    if not croc_is_live(chat_id):
+        return False
+    g = croc[chat_id]
+    u = message.from_user
+    text = norm(message.text or "")
+    word = norm(g["word"])
+
+    if u.id == g["leader"][0]:
+        if word in text:
+            try:
+                await message.delete()
+            except Exception:
+                pass
+            await message.answer("🙈 Ведущему нельзя называть слово!")
+            return True
+        return False
+
+    if text != word:
+        return False
+
+    croc.pop(chat_id, None)
+    name = label(chat_id, u)
+    sc = croc_scores.setdefault(chat_id, {})
+    _old, pts = sc.get(u.id, (name, 0))
+    sc[u.id] = (name, pts + 1)
+    await fire(message.bot, chat_id, message.message_id)
+    await message.reply(
+        f"🎉 <b>{html.escape(name)}</b> угадал(а) слово «{html.escape(g['word'])}»! "
+        f"Очков: <b>{pts + 1}</b>",
+        parse_mode="HTML",
+    )
     try:
-        await bot.send_message(chat_id, text)
+        await message.bot.edit_message_text(
+            chat_id=chat_id, message_id=g["msg"],
+            text=f"🐊 Раунд окончен. Слово: <b>{html.escape(g['word'])}</b>\nУгадал(а): {html.escape(name)}",
+            parse_mode="HTML", reply_markup=croc_idle_kb(),
+        )
     except Exception:
         pass
-
-
-async def do_action(bot: Bot, chat_id: int, room: dict, uid: int, name: str, a, v):
-    xo, c = room["xo"], room["croc"]
-    ids = [p[0] for p in xo["p"].values()]
-    if a == "xo_join" and uid not in ids:
-        for sym in "XO":
-            if sym not in xo["p"]:
-                xo["p"][sym] = [uid, name]
-                break
-    elif a == "xo_move" and xo["win"] is None and len(xo["p"]) == 2:
-        sym = xo["turn"]
-        if isinstance(v, int) and 0 <= v < 9 and xo["p"][sym][0] == uid and not xo["b"][v]:
-            xo["b"][v] = sym
-            xo["win"] = xo_result(xo["b"])
-            if xo["win"] == "draw":
-                await say(bot, chat_id, "❌⭕ Крестики-нолики: ничья 🤝")
-            elif xo["win"]:
-                await say(bot, chat_id, f"❌⭕ Крестики-нолики: победил(а) {name} 🔥")
-            else:
-                xo["turn"] = "O" if sym == "X" else "X"
-    elif a == "xo_reset" and xo["win"] and uid in ids:
-        room["xo"] = new_xo(xo["p"])
-    elif a == "xo_leave" and uid in ids and (xo["win"] or len(ids) < 2):
-        room["xo"] = new_xo()
-    elif a == "croc_lead" and not c["active"]:
-        c.update(active=True, leader=[uid, name], word=random.choice(WORDS), log=[], msg="")
-    elif a == "croc_new" and c["active"] and c["leader"][0] == uid:
-        old = c["word"]
-        while c["word"] == old:
-            c["word"] = random.choice(WORDS)
-    elif a == "croc_giveup" and c["active"] and c["leader"][0] == uid:
-        c["msg"] = f"🏳️ Ведущий сдался. Слово было: {c['word']}"
-        c["active"] = False
-    elif a == "croc_guess" and c["active"] and c["leader"][0] != uid and isinstance(v, str):
-        t = v.strip()[:60]
-        if not t:
-            return
-        if norm(t) == norm(c["word"]):
-            c["active"] = False
-            sc = croc_scores.setdefault(chat_id, {})
-            _o, pts = sc.get(uid, (name, 0))
-            sc[uid] = (name, pts + 1)
-            c["msg"] = f"🎉 {name} угадал(а): {c['word']}"
-            await say(bot, chat_id, f"🐊 Крокодил: {name} угадал(а) слово «{c['word']}» 🔥 (очков: {pts + 1})")
-        else:
-            c["log"].append([name, t])
-            c["log"] = c["log"][-25:]
-
-
-def view_for(chat_id: int, room: dict, uid: int) -> dict:
-    c = room["croc"]
-    top = sorted(croc_scores.get(chat_id, {}).values(), key=lambda x: x[1], reverse=True)[:5]
-    return {
-        "me": uid, "xo": room["xo"], "scores": top,
-        "croc": {"active": c["active"], "leader": c["leader"], "log": c["log"], "msg": c["msg"],
-                 "word": c["word"] if c["active"] and c["leader"][0] == uid else None},
-    }
-
-
-async def api(request):
-    def err(text, code):
-        return web.json_response({"error": text}, status=code)
-    try:
-        body = await request.json()
-    except Exception:
-        return err("bad request", 400)
-    auth = check_init(str(body.get("init", "")))
-    if not auth:
-        return err("Открой игры кнопкой из группового чата", 401)
-    user, chat_id = auth
-    bot = request.app["bot"]
-    uid = user["id"]
-    if is_blocked(chat_id) or is_user_blocked(uid):
-        return err("Недоступно", 403)
-    key = (chat_id, uid)
-    if time.time() - member_cache.get(key, 0) > 600:
-        try:
-            m = await bot.get_chat_member(chat_id, uid)
-            ok = m.status not in ("left", "kicked")
-        except Exception:
-            ok = False
-        if not ok:
-            return err("Ты не участник этого чата", 403)
-        member_cache[key] = time.time()
-    name = f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or "Игрок"
-    pref = get_prefix(chat_id, uid)
-    if pref:
-        name = f"{pref} {name}"
-    room = get_room(chat_id)
-    a = body.get("a")
-    if a:
-        await do_action(bot, chat_id, room, uid, name, a, body.get("v"))
-    return web.json_response(view_for(chat_id, room, uid))
-
-
-async def index(_request):
-    return web.FileResponse(INDEX_PATH)
+    return True
 
 
 
@@ -1953,6 +2069,9 @@ async def group_text(message: Message):
     if u is None or u.is_bot:
         return
 
+    if await croc_try(message):
+        return
+
     await maybe_mimic(message)
 
 
@@ -2028,9 +2147,6 @@ async def main():
     # мини-сервер, чтобы бесплатный хостинг видел открытый порт
     app = web.Application()
     app.router.add_get("/", health)
-    app.router.add_get("/app", index)
-    app.router.add_post("/api", api)
-    app["bot"] = bot
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", "8080"))).start()
